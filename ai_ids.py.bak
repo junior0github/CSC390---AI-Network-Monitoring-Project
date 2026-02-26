@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+import json
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import LabelEncoder
+from pathlib import Path
+import time
+from datetime import datetime
+
+# ----- CONFIGURATION -----
+SURICATA_LOG = "/var/log/suricata/eve.json"
+ZEEK_CONN_LOG = "/home/cpe326/zeek_logs/conn.log"
+ALERT_OUTPUT = "/home/cpe326/ai_ids/alerts.csv"
+POLL_INTERVAL = 2  # seconds
+FEATURE_COLUMNS = ['src_ip', 'dest_ip', 'src_port', 'dest_port', 'proto']
+
+# ----- HELPER FUNCTIONS -----
+def load_new_lines(file_path, last_pos):
+    """Load new lines from the file since last read position."""
+    with open(file_path, 'r') as f:
+        f.seek(last_pos)
+        lines = f.readlines()
+        last_pos = f.tell()
+    return lines, last_pos
+
+def preprocess(lines):
+    """Convert Suricata logs to two DataFrames: original and encoded."""
+    data = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+            if 'alert' in event:
+                data.append({
+                    'src_ip': event.get('src_ip', '0.0.0.0'),
+                    'dest_ip': event.get('dest_ip', '0.0.0.0'),
+                    'src_port': int(event.get('src_port', 0)),
+                    'dest_port': int(event.get('dest_port', 0)),
+                    'proto': event.get('proto', 'UNK'),
+                    'timestamp': event.get('timestamp', datetime.now().isoformat())
+                })
+        except json.JSONDecodeError:
+            continue
+
+    if not data:
+        return pd.DataFrame(), pd.DataFrame()  # return empty tuple if no data
+
+    df_orig = pd.DataFrame(data)
+    df_enc = df_orig.copy()
+
+    # Encode categorical features for the model
+    for col in ['src_ip', 'dest_ip', 'proto']:
+        le = LabelEncoder()
+        df_enc[col] = le.fit_transform(df_enc[col].astype(str))
+
+    return df_orig, df_enc
+
+# ----- ZEEK PREPROCESSING ----- #
+def preprocess_zeek(lines):
+    """Convert Zeek conn.log lines into model-ready DataFrames."""
+    data = []
+
+    for line in lines:
+        if line.startswith("#") or not line.strip():
+            continue
+
+        parts = line.strip().split("\t")
+
+        try:
+            data.append({
+                'src_ip': parts[2],
+                'dest_ip': parts[4],
+                'src_port': int(parts[3]),
+                'dest_port': int(parts[5]),
+                'proto': parts[6],
+                'timestamp': parts[0]
+            })
+        except (IndexError, ValueError):
+            continue
+
+    if not data:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_orig = pd.DataFrame(data)
+    df_enc = df_orig.copy()
+
+    for col in ['src_ip', 'dest_ip', 'proto']:
+        le = LabelEncoder()
+        df_enc[col] = le.fit_transform(df_enc[col].astype(str))
+
+    return df_orig, df_enc
+
+# ----- INIT MODEL -----
+model = IsolationForest(contamination=0.01, n_estimators=100, random_state=42)
+# Initial dummy training
+dummy = pd.DataFrame({'src_ip':[0],'dest_ip':[0],'src_port':[0],'dest_port':[0],'proto':[0]})
+model.fit(dummy)
+
+# ----- ENSURE ALERT FILE EXISTS -----
+Path(ALERT_OUTPUT).parent.mkdir(parents=True, exist_ok=True)
+Path(ALERT_OUTPUT).touch(exist_ok=True)
+
+# ----- MAIN LOOP -----
+last_suricata_pos = 0
+last_zeek_pos = 0
+print("AI IDS running... Monitoring Suricata & Zeek logs in real-time.\n")
+
+while True:
+
+    # ---- SURICATA ----
+    suricata_lines, last_suricata_pos = load_new_lines(SURICATA_LOG, last_suricata_pos)
+    if suricata_lines:
+        df_orig_s, df_enc_s = preprocess(suricata_lines)
+
+    # ---- ZEEK ----
+    zeek_lines, last_zeek_pos = load_new_lines(ZEEK_CONN_LOG, last_zeek_pos)
+    if zeek_lines:
+        df_orig_z, df_enc_z = preprocess_zeek(zeek_lines)
+
+    # Combine both sources
+    frames_orig = []
+    frames_enc = []
+
+    if 'df_enc_s' in locals() and not df_enc_s.empty:
+        frames_orig.append(df_orig_s)
+        frames_enc.append(df_enc_s)
+
+    if 'df_enc_z' in locals() and not df_enc_z.empty:
+        frames_orig.append(df_orig_z)
+        frames_enc.append(df_enc_z)
+
+    if frames_enc:
+        df_orig_all = pd.concat(frames_orig, ignore_index=True)
+        df_enc_all = pd.concat(frames_enc, ignore_index=True)
+
+        df_enc_all['anomaly'] = model.predict(df_enc_all[FEATURE_COLUMNS])
+        df_orig_all['anomaly'] = df_enc_all['anomaly']
+
+        suspicious = df_orig_all[df_orig_all['anomaly'] == -1]
+
+        if not suspicious.empty:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{timestamp}] [ALERT] {len(suspicious)} suspicious events detected!")
+            print(suspicious[['timestamp','src_ip','dest_ip','src_port','dest_port','proto','anomaly']])
+
+            suspicious[['timestamp','src_ip','dest_ip','src_port','dest_port','proto','anomaly']].to_csv(
+                ALERT_OUTPUT, mode='a', header=False, index=False
+            )
+
+        model.fit(df_enc_all[FEATURE_COLUMNS])
+
+    time.sleep(POLL_INTERVAL)
